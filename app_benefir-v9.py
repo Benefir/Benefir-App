@@ -22,132 +22,118 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-DB_PATH = "benefir.db"
-
 # ==========================================
-# CONECTOR BASE DE DATOS DUAL (SUPABASE POSTGRESQL / SQLITE)
+# CONEXIÓN DUAL: SUPABASE (POSTGRESQL) Y SQLITE
 # ==========================================
-import re as _re
+import re
 
 try:
     import psycopg2
-    from psycopg2.extras import DictCursor
+    import psycopg2.extras
     HAS_PSYCOPG2 = True
 except ImportError:
     HAS_PSYCOPG2 = False
 
-class PGRowWrapper:
-    def __init__(self, row, description):
-        self._row = row
-        self._keys = [desc[0] for desc in description] if description else []
-        self._dict = dict(zip(self._keys, row)) if row is not None else {}
+class RowWrapper(tuple):
+    def __new__(cls, description, row_tuple):
+        obj = super().__new__(cls, row_tuple)
+        obj._mapping = {col[0]: val for col, val in zip(description, row_tuple)} if description else {}
+        return obj
 
-    def __getitem__(self, item):
-        if isinstance(item, int):
-            return self._row[item]
-        return self._dict[item]
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return self._mapping.get(key)
+        return super().__getitem__(key)
 
     def keys(self):
-        return self._keys
+        return list(self._mapping.keys())
 
     def get(self, key, default=None):
-        return self._dict.get(key, default)
+        if isinstance(key, str):
+            return self._mapping.get(key, default)
+        return super().__getitem__(key)
+
+    def __contains__(self, key):
+        if isinstance(key, str):
+            return key in self._mapping
+        return super().__contains__(key)
+
+def _translate_sql(sql):
+    if not sql: return sql
+    sql_tr = sql
+    sql_tr = re.sub(r'INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT', 'SERIAL PRIMARY KEY', sql_tr, flags=re.IGNORECASE)
+    pragma_match = re.search(r'PRAGMA\s+table_info\s*\(\s*["\']?(\w+)["\']?\s*\)', sql_tr, flags=re.IGNORECASE)
+    if pragma_match:
+        tbl = pragma_match.group(1).lower()
+        return f"SELECT 0 AS cid, column_name AS name FROM information_schema.columns WHERE lower(table_name) = '{tbl}'"
+    sql_tr = re.sub(r'INSERT\s+OR\s+IGNORE\s+INTO\s+(\w+)\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)', r'INSERT INTO \1 (\2) VALUES (\3) ON CONFLICT DO NOTHING', sql_tr, flags=re.IGNORECASE)
+    sql_tr = re.sub(r'INSERT\s+OR\s+REPLACE\s+INTO\s+config\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)', r'INSERT INTO config (\1) VALUES (\2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value', sql_tr, flags=re.IGNORECASE)
+    sql_tr = re.sub(r'INSERT\s+OR\s+REPLACE\s+INTO\s+(\w+)', r'INSERT INTO \1', sql_tr, flags=re.IGNORECASE)
+    sql_tr = sql_tr.replace('?', '%s')
+    return sql_tr
 
 class PGCursorWrapper:
-    def __init__(self, cursor):
-        self.cursor = cursor
+    def __init__(self, pg_cursor):
+        self.cursor = pg_cursor
         self.description = None
-        self.lastrowid = None
+        self.rowcount = -1
 
     def execute(self, sql, params=None):
-        adapted_sql = self._adapt_sql(sql)
-        if params is None:
-            params = ()
-        elif isinstance(params, (list, tuple)):
-            params = tuple(params)
-
-        # Handle lastrowid for INSERT statements
-        if adapted_sql.strip().upper().startswith("INSERT") and " RETURNING " not in adapted_sql.upper():
-            # Check if table has id column
-            m_tbl = _re.search(r'INSERT\s+INTO\s+(\w+)', adapted_sql, _re.IGNORECASE)
-            if m_tbl:
-                tbl_name = m_tbl.group(1)
-                adapted_sql_returning = adapted_sql + " RETURNING id"
-                try:
-                    self.cursor.execute(adapted_sql_returning, params)
-                    self.description = self.cursor.description
-                    row = self.cursor.fetchone()
-                    if row:
-                        self.lastrowid = row[0]
-                    return self
-                except Exception:
-                    pass
-
-        self.cursor.execute(adapted_sql, params)
-        self.description = self.cursor.description
+        sql_tr = _translate_sql(sql)
+        try:
+            if params:
+                if isinstance(params, (list, tuple)):
+                    params_clean = []
+                    for p in params:
+                        if isinstance(p, (datetime.date, datetime.datetime)):
+                            params_clean.append(str(p))
+                        else:
+                            params_clean.append(p)
+                    self.cursor.execute(sql_tr, tuple(params_clean))
+                else:
+                    self.cursor.execute(sql_tr, params)
+            else:
+                self.cursor.execute(sql_tr)
+            self.description = self.cursor.description
+            self.rowcount = getattr(self.cursor, 'rowcount', -1)
+        except Exception as e:
+            raise e
         return self
-
-    def _adapt_sql(self, sql):
-        # PRAGMA table_info(tbl)
-        m = _re.search(r'PRAGMA\s+table_info\((\w+)\)', sql, _re.IGNORECASE)
-        if m:
-            tbl = m.group(1)
-            return f"SELECT 0 AS cid, column_name AS name FROM information_schema.columns WHERE table_name = '{tbl}'"
-
-        # AUTOINCREMENT -> SERIAL
-        sql = _re.sub(r'id\s+INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT', 'id SERIAL PRIMARY KEY', sql, flags=_re.IGNORECASE)
-
-        # INSERT OR IGNORE INTO tbl (cols) VALUES (vals)
-        if 'INSERT OR IGNORE INTO' in sql.upper():
-            sql = _re.sub(r'INSERT\s+OR\s+IGNORE\s+INTO', 'INSERT INTO', sql, flags=_re.IGNORECASE)
-            sql = sql + ' ON CONFLICT DO NOTHING'
-
-        # Convert ? to %s
-        sql = sql.replace('?', '%s')
-        return sql
 
     def fetchone(self):
         res = self.cursor.fetchone()
-        if res is None:
-            return None
-        return PGRowWrapper(res, self.cursor.description)
+        if res is None: return None
+        return RowWrapper(self.cursor.description, res)
 
     def fetchall(self):
-        res = self.cursor.fetchall()
-        if not res:
-            return []
+        rows = self.cursor.fetchall()
         desc = self.cursor.description
-        return [PGRowWrapper(row, desc) for row in res]
-
-    def fetchmany(self, size=None):
-        res = self.cursor.fetchmany(size) if size else self.cursor.fetchmany()
-        if not res:
-            return []
-        desc = self.cursor.description
-        return [PGRowWrapper(row, desc) for row in res]
+        return [RowWrapper(desc, r) for r in rows]
 
     def close(self):
-        try:
-            self.cursor.close()
-        except Exception:
-            pass
+        try: self.cursor.close()
+        except Exception: pass
 
 class PGConnectionWrapper:
     def __init__(self, pg_conn):
         self.conn = pg_conn
-        self.row_factory = None
 
     def cursor(self):
         return PGCursorWrapper(self.conn.cursor())
 
     def commit(self):
-        self.conn.commit()
+        try: self.conn.commit()
+        except Exception: pass
 
     def rollback(self):
-        self.conn.rollback()
+        try: self.conn.rollback()
+        except Exception: pass
 
     def close(self):
-        self.conn.close()
+        try: self.conn.close()
+        except Exception: pass
+
+DB_PATH = "benefir.db"
 
 def get_db_connection():
     db_url = None
@@ -156,18 +142,22 @@ def get_db_connection():
             db_url = st.secrets["DATABASE_URL"]
     except Exception:
         pass
-
     if not db_url:
         db_url = os.environ.get("DATABASE_URL")
-
+    
     if db_url and HAS_PSYCOPG2:
         try:
             pg_conn = psycopg2.connect(db_url)
             pg_conn.autocommit = True
+            if hasattr(st, 'session_state'):
+                st.session_state['db_status'] = 'supabase'
             return PGConnectionWrapper(pg_conn)
         except Exception as e:
-            st.warning(f"⚠️ Aviso de conexión Supabase: {e}. Usando respaldo local.")
-
+            if hasattr(st, 'session_state'):
+                st.session_state['db_status'] = f'error: {e}'
+    
+    if hasattr(st, 'session_state'):
+        st.session_state['db_status'] = 'local'
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
@@ -676,6 +666,14 @@ if not st.session_state.user_authenticated:
 # 4. BARRA LATERAL (VERSIÓN 7 - 100% LIMPIA)
 # ==========================================
 with st.sidebar:
+    db_st = st.session_state.get('db_status', '')
+    if db_st == 'supabase':
+        st.sidebar.success("🟢 **Base de Datos:** Supabase (Nube - Permanente)")
+    elif db_st.startswith('error:'):
+        st.sidebar.error(f"❌ **Error Supabase:** {db_st[6:]}")
+    else:
+        st.sidebar.warning("⚠️ **Base de Datos:** Local (Agrega DATABASE_URL en Secrets para guardar en Supabase)")
+
     logo_data = cfg.get("logo_data", "")
     logo_url = cfg.get("logo_url", "")
     
